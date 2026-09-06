@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+
 import torch
 
 try:
@@ -17,8 +19,46 @@ import warnings
 
 __all__ = [
     'flash_attention',
+    'sdpa_attention',
     'attention',
 ]
+
+# auto|cudnn|flash|sdpa. auto picks cuDNN when it is equivalent (~2x faster on
+# sm_100, slower on Hopper), so it is resolved per-device rather than pinned.
+ATTN_BACKEND = os.getenv('WAN_ATTN_BACKEND', 'auto').lower()
+
+_CUDNN_SDPA_OK = None
+_WARNED = set()
+
+
+def _warn_once(key, msg):
+    if key not in _WARNED:
+        _WARNED.add(key)
+        warnings.warn(msg)
+
+
+def _flash_available():
+    return FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE
+
+
+def _cudnn_sdpa_ok():
+    """Probe the cuDNN SDPA backend once; not all builds/shapes support it."""
+    global _CUDNN_SDPA_OK
+    if _CUDNN_SDPA_OK is None:
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            x = torch.zeros(1, 2, 8, 64, device='cuda', dtype=torch.bfloat16)
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                torch.nn.functional.scaled_dot_product_attention(x, x, x)
+            _CUDNN_SDPA_OK = True
+        except Exception:
+            _CUDNN_SDPA_OK = False
+    return _CUDNN_SDPA_OK
+
+
+def _unpadded(lens, length):
+    """True when `lens` imposes no mask, so SDPA is equivalent to varlen."""
+    return lens is None or int(lens.min()) >= length
 
 
 def flash_attention(
@@ -107,7 +147,7 @@ def flash_attention(
             max_seqlen_k=lk,
             softmax_scale=softmax_scale,
             causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
+            deterministic=deterministic)[0]
     else:
         assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(
@@ -124,10 +164,69 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+            deterministic=deterministic)
+
+    # varlen returns sum(q_lens) rows; that is b*lq only when q_lens is uniform.
+    if x.size(0) == b * lq:
+        x = x.unflatten(0, (b, lq))
+    else:
+        packed, x = x, x.new_zeros(b, lq, *x.shape[1:])
+        offset = 0
+        for i, n in enumerate(q_lens.tolist()):
+            x[i, :n] = packed[offset:offset + n]
+            offset += n
 
     # output
     return x.type(out_dtype)
+
+
+def sdpa_attention(
+    q,
+    k,
+    v,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    dtype=torch.bfloat16,
+    force_cudnn=False,
+):
+    """torch SDPA over [B, L, N, C] inputs; cannot mask padding."""
+    half_dtypes = (torch.float16, torch.bfloat16)
+    out_dtype = q.dtype
+
+    def half(x):
+        return x if x.dtype in half_dtypes else x.to(dtype)
+
+    q, k, v = half(q), half(k), half(v)
+    q = q.to(v.dtype)
+    k = k.to(v.dtype)
+
+    if q_scale is not None:
+        q = q * q_scale
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    def _run():
+        return torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p,
+            scale=softmax_scale)
+
+    if force_cudnn:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            out = _run()
+    else:
+        out = _run()
+
+    return out.transpose(1, 2).contiguous().type(out_dtype)
 
 
 def attention(
@@ -145,7 +244,44 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    """Dispatch to the fastest backend that is correct here; padding and sliding
+    windows always route to flash-attn, whatever the preference."""
+    windowed = tuple(window_size) != (-1, -1)
+    unpadded = _unpadded(q_lens, q.size(1)) and _unpadded(k_lens, k.size(1))
+    needs_flash = windowed or not unpadded
+
+    backend = ATTN_BACKEND
+    if backend not in ('auto', 'cudnn', 'flash', 'sdpa'):
+        _warn_once('bad-backend',
+                   f'Unknown WAN_ATTN_BACKEND={backend!r}, using auto.')
+        backend = 'auto'
+
+    if needs_flash:
+        if _flash_available():
+            if backend in ('cudnn', 'sdpa'):
+                _warn_once(
+                    'needs-flash', f'WAN_ATTN_BACKEND={backend} cannot express '
+                    f'{"a sliding window" if windowed else "padded q/k lens"}; '
+                    'using flash attention for those calls to stay correct.')
+            backend = 'flash'
+        else:
+            # SDPA is all that is left, and it will attend over padding.
+            _warn_once(
+                'sdpa-padded',
+                'Padding mask is disabled when using scaled_dot_product_'
+                'attention. It can have a significant impact on performance.')
+            backend = 'sdpa'
+    elif backend == 'auto':
+        backend = 'cudnn' if (q.is_cuda and _cudnn_sdpa_ok()) else (
+            'flash' if _flash_available() else 'sdpa')
+    elif backend == 'flash' and not _flash_available():
+        _warn_once(
+            'no-flash',
+            'WAN_ATTN_BACKEND=flash but flash-attn is not installed; '
+            'falling back to torch SDPA.')
+        backend = 'sdpa'
+
+    if backend == 'flash':
         return flash_attention(
             q=q,
             k=k,
@@ -161,19 +297,15 @@ def attention(
             dtype=dtype,
             version=fa_version,
         )
-    else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+    return sdpa_attention(
+        q=q,
+        k=k,
+        v=v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        q_scale=q_scale,
+        causal=causal,
+        dtype=dtype,
+        force_cudnn=(backend == 'cudnn'),
+    )
