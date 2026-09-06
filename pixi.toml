@@ -1,0 +1,74 @@
+[workspace]
+name = "wan21"
+version = "2.1.0"
+description = "Wan2.1 video generation - pixi environment (B200 / sm_100)"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# Thin on purpose: interpreter plus what is painful to get from PyPI.
+[dependencies]
+python = "3.12.*"
+ffmpeg = "*"
+
+# Mirrors requirements.txt. torch 2.9/cu128 is load-bearing: sm_100 needs CUDA
+# >=12.8, and 2.9 is the newest torch with a prebuilt flash-attn wheel (see below).
+[pypi-dependencies]
+torch = { version = "==2.9.*", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.24.*", index = "https://download.pytorch.org/whl/cu128" }
+
+# Has real sm_100 kernels; ABI-tagged per torch minor, so re-check on any bump.
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+
+opencv-python = ">=4.9.0.80"
+diffusers = ">=0.31.0"
+# Caps are not upstream: Wan2.1 targets the transformers 4.x / gradio 5.x APIs.
+transformers = ">=4.49.0,<5"
+gradio = ">=5.0.0,<6"
+tokenizers = ">=0.20.3"
+accelerate = ">=1.1.1"
+tqdm = "*"
+imageio = "*"
+easydict = "*"
+ftfy = "*"
+dashscope = "*"
+imageio-ffmpeg = "*"
+numpy = ">=1.23.5,<2"
+
+[tasks]
+# Re-run after any torch/flash-attn change: kernels for this GPU, backend picked.
+verify = """python -c '
+import torch, wan
+from wan.modules import attention as A
+print("torch", torch.__version__, "| cuda", torch.cuda.is_available())
+print("backend:", A.ATTN_BACKEND, "| flash_attn:", A._flash_available())
+if torch.cuda.is_available():
+    p = torch.cuda.get_device_properties(0)
+    sm = "sm_%d%d" % (p.major, p.minor)
+    print(p.name, sm, "| kernels:", sm in torch.cuda.get_arch_list(),
+          "| cudnn_sdpa:", A._cudnn_sdpa_ok())
+else:
+    print("(no GPU here -- run inside a Slurm allocation for the full check)")
+'"""
+
+# Mirrors the repo Makefile's `format` target.
+format = "isort generate.py gradio wan && yapf -i -r *.py generate.py gradio wan"
+
+# pyproject's dev extras, plus yapf, which the Makefile needs but never declares.
+[feature.dev.pypi-dependencies]
+pytest = "*"
+black = "*"
+flake8 = "*"
+isort = "*"
+mypy = "*"
+yapf = "*"
+# <1.0 for transformers 4.x, which also keeps the `[cli]` extra valid.
+huggingface-hub = { version = "<1.0", extras = ["cli"] }
+
+# Multi-GPU only (--ulysses_size / --ring_size); imported lazily by generate.py.
+[feature.dist.pypi-dependencies]
+xfuser = ">=0.4.1"
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+dist = { features = ["dist", "dev"], solve-group = "default" }
