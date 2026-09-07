@@ -23,6 +23,17 @@ sbatch --partition=dedicated-2 --gres=gpu:8 --cpus-per-task=64 --mem=256G \
 srun --jobid=<JOBID> --overlap --ntasks=1 pixi run -e dev verify
 ```
 
+Raise `ulimit -d` before loading the 14B model. Some nodes set RLIMIT_DATA to
+64 GiB, which counts the mmap'd checkpoint shards: diffusers gets through five
+shards plus the T5 encoder (~60 GB of address space) and then fails on shard 6
+with `unable to mmap ...: Cannot allocate memory` -- at only ~24 GiB resident.
+Its error handler then reads the 7.9 GB shard as text and reports `MemoryError`,
+which hides the real cause. The hard limit is unlimited, so:
+
+```sh
+ulimit -d unlimited
+```
+
 `debug` is often fully allocated (4 h limit, 1 node); `dedicated-2` usually has
 free B200s. Check with:
 
@@ -38,6 +49,20 @@ pixi run -e dev verify
 
 Inside an allocation it should print `sm_100 | kernels for it: True` and
 `cudnn_sdpa usable: True`. Re-run it after any torch or flash-attn change.
+
+## Solvers
+
+`--sample_solver` takes `unipc` (default), `dpm++`, or `euler`.
+`wan/utils/fm_solvers_euler.py` is a plain first-order baseline -- one line,
+`x += (sigma_next - sigma) * v` -- on the same sigma schedule as UniPC, so a
+swapped run differs only in the update rule.
+
+Measured on 14B 720p 81f, 50 steps, seed 42, identical prompt: both solvers run
+at **13.8 s/step** (the solver arithmetic is nothing against a 14B forward), but
+the outputs differ substantially -- mean absolute pixel difference 15.7/255,
+correlation 0.88, no identical frames. UniPC holds highlights and fine texture
+noticeably better. So at Wan's defaults the corrector is buying real quality,
+not just insurance.
 
 ## Attention backend
 
