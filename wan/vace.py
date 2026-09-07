@@ -417,6 +417,14 @@ class WanVace(WanT2V):
                     sample_scheduler,
                     device=self.device,
                     sigmas=sampling_sigmas)
+            elif sample_solver == 'euler':
+                sample_scheduler = FlowEulerScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+                timesteps = sample_scheduler.timesteps
             else:
                 raise NotImplementedError("Unsupported solver.")
 
@@ -708,6 +716,14 @@ class WanVaceMP(WanVace):
                             sample_scheduler,
                             device=gpu,
                             sigmas=sampling_sigmas)
+                    elif sample_solver == 'euler':
+                        sample_scheduler = FlowEulerScheduler(
+                            num_train_timesteps=self.num_train_timesteps,
+                            shift=1,
+                            use_dynamic_shifting=False)
+                        sample_scheduler.set_timesteps(
+                            sampling_steps, device=self.device, shift=shift)
+                        timesteps = sample_scheduler.timesteps
                     else:
                         raise NotImplementedError("Unsupported solver.")
 
