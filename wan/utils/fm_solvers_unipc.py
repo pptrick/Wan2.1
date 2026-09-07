@@ -111,7 +111,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         sigmas = 1.0 - alphas
         sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
 
-        if not use_dynamic_shifting:
+        if not use_dynamic_shifting and shift is not None:
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
             sigmas = shift * sigmas / (1 +
                                        (shift - 1) * sigmas)  # pyright: ignore
